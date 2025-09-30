@@ -1,0 +1,5 @@
+{
+  "123": { "shippingMethod": "Convenience Store Pickup", "ShippingFee": 60 },
+  "456": { "shippingMethod": "Home Delivery", "ShippingFee": 100 },
+  "789": { "shippingMethod": "Self Pickup", "ShippingFee": 0 }
+}
