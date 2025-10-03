@@ -4,14 +4,37 @@ import express from 'express'
 import mongoose from 'mongoose'
 import dotenv from 'dotenv'
 import cors from 'cors'
-import jwt from 'jsonwebtoken'
-import bcrypt from 'bcrypt'
 import multer from 'multer'
+import admin from 'firebase-admin'
+import fetch from 'node-fetch'
+import fs from 'fs'
 
 dotenv.config()
 const app = express()
 app.use(express.json())
 app.use(cors())
+
+
+// ✅ 初始化 Firebase Admin
+admin.initializeApp({
+  credential: admin.credential.cert("/etc/secrets/service-account.json")
+});
+
+// ✅ Firebase 身份驗證 middleware
+async function authenticateFirebaseToken(req, res, next) {
+  const authHeader = req.headers['authorization']
+  if (!authHeader) return res.status(401).json({ message: 'No token provided' })
+
+  const token = authHeader.split(' ')[1] // "Bearer <idToken>"
+  try {
+    const decoded = await admin.auth().verifyIdToken(token)
+    req.user = decoded // decoded.uid, decoded.email 都在這裡
+    next()
+  } catch (err) {
+    console.error('❌ Firebase Token 驗證失敗:', err.message)
+    return res.status(403).json({ message: 'Invalid Firebase token' })
+  }
+}
 
 // Multer 設定：記憶體儲存，圖片轉成 Buffer 存在 req.files
 const upload = multer({
@@ -101,122 +124,74 @@ const cartSchema = new mongoose.Schema({
 })
 
 const userSchema = new mongoose.Schema({
+  firebaseUid: String, // 🔑 用 Firebase UID 當唯一識別
   email: String,
-  password: String,
   orders: [orderSchema],
   cart: {
     type: cartSchema,
     default: { products: [] } // 👈 預設為空購物車
-  },
-  refreshTokens: [String]
+  }
 })
 
 const User = mongoose.model('User', userSchema)
 
-// JWT 工具
-function generateAccessToken(user) {
-  return jwt.sign({ id: user._id }, process.env.ACCESS_TOKEN_SECRET, { expiresIn: '15m' })
-}
-function generateRefreshToken(user) {
-  return jwt.sign({ id: user._id }, process.env.REFRESH_TOKEN_SECRET)
-}
-
-// 身份驗證 middleware
-function authenticateToken(req, res, next) {
-  const authHeader = req.headers['authorization']
-  const token = authHeader && authHeader.split(' ')[1]
-  if (!token) return res.sendStatus(401)
-  jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, user) => {
-    if (err) return res.sendStatus(403)
-    req.user = user
-    next()
-  })
+// 🛠️ 工具：找到或建立 User
+async function findOrCreateUser(uid, email) {
+  let user = await User.findOne({ firebaseUid: uid })
+  if (!user) {
+    user = await User.create({ firebaseUid: uid, email })
+  }
+  return user
 }
 
-// 註冊
-app.post('/register', async (req, res) => {
-  const { email, password } = req.body
-  if (!email || !password) return res.status(400).json({ message: 'Email and password required' })
-  const existing = await User.findOne({ email })
-  if (existing) return res.status(400).json({ message: 'Email already registered' })
-  const hashed = await bcrypt.hash(password, 10)
-  await new User({ email, password: hashed }).save()
-  res.json({ message: 'User registered' })
-})
-
-// 登入
-app.post('/login', async (req, res) => {
-  const { email, password } = req.body
-  const user = await User.findOne({ email })
-  if (!user || !(await bcrypt.compare(password, user.password)))
-    return res.status(403).json({ message: 'Invalid credentials' })
-  const accessToken = generateAccessToken(user)
-  const refreshToken = generateRefreshToken(user)
-  user.refreshTokens.push(refreshToken)
-  await user.save()
-  res.json({ accessToken, refreshToken })
-})
-
-// refresh token
-app.post('/refresh', async (req, res) => {
-  const token = req.headers['x-refresh-token']
-  if (!token) return res.sendStatus(401)
-  const user = await User.findOne({ refreshTokens: token })
-  if (!user) return res.sendStatus(403)
-  jwt.verify(token, process.env.REFRESH_TOKEN_SECRET, async (err, decoded) => {
-    if (err) return res.sendStatus(403)
-    const accessToken = generateAccessToken({ _id: decoded.id })
-    const newRefreshToken = generateRefreshToken({ _id: decoded.id })
-    user.refreshTokens = user.refreshTokens.filter(t => t !== token)
-    user.refreshTokens.push(newRefreshToken)
-    await user.save()
-    res.json({ accessToken, refreshToken: newRefreshToken })
-  })
-})
-
-// 登出
-app.post('/logout', async (req, res) => {
-  const { token } = req.body
-  if (!token) return res.sendStatus(400)
-  const user = await User.findOne({ refreshTokens: token })
-  if (!user) return res.sendStatus(403)
-  user.refreshTokens = user.refreshTokens.filter(t => t !== token)
-  await user.save()
-  res.json({ message: 'Logged out successfully' })
-})
 
 // 取得使用者資料（含 orders + review 圖片 URL）
-app.get('/me', authenticateToken, async (req, res) => {
-  const user = await User.findById(req.user.id)
-  if (!user) return res.status(404).json({ message: 'User not found' })
-  const orders = user.orders.map(o => ({
-    _id: o._id,
-    products: o.products,
-    shippingMethod: o.shippingMethod,
-    createdAt: o.createdAt,
-    totalAmount: o.totalAmount,
-    shippingFee: o.shippingFee,
-    coupon: o.coupon,
-    review: o.review
-      ? {
-          comment: o.review.comment,
-          rating: o.review.rating,
-          imageUrls: o.review.imageFiles.map((_, i) =>
-            `https://${req.get('host')}/order/${o._id}/review/image/${i}`
-          )
-        }
-      : null
-  }))
-  // ✅ 新增 cart 回傳
-  const cart = user.cart?.products || []  // cart 是單一物件
+app.get('/me', authenticateFirebaseToken, async (req, res) => {
+  try {
+    // 🔑 從 Firebase decoded token 取出 uid & email
+    const { uid, email } = req.user
 
-  res.json({
-    id: user._id,
-    email: user.email,
-    orders,
-    cart // ✅ 加上這一行
-  })
+    // 找或建立 user
+    const user = await findOrCreateUser(uid, email)
+    if (!user) return res.status(404).json({ message: 'User not found' })
+
+    // 格式化 orders，處理 review 圖片
+    const orders = user.orders.map(o => ({
+      _id: o._id,
+      products: o.products,
+      shippingMethod: o.shippingMethod,
+      createdAt: o.createdAt,
+      totalAmount: o.totalAmount,
+      shippingFee: o.shippingFee,
+      coupon: o.coupon,
+      review: o.review
+        ? {
+            comment: o.review.comment,
+            rating: o.review.rating,
+            imageUrls: o.review.imageFiles.map((_, i) =>
+              // 🔑 用 host + orderId + index 做圖片 URL
+              `https://${req.get('host')}/order/${o._id}/review/image/${i}`
+            )
+          }
+        : null
+    }))
+
+    // ✅ 加上 cart
+    const cart = user.cart?.products || []
+
+    res.json({
+      id: user._id,
+      firebaseUid: user.firebaseUid,
+      email: user.email,
+      orders,
+      cart,
+    })
+  } catch (err) {
+    console.error('❌ /me API 錯誤:', err.message)
+    res.status(500).json({ message: 'Server error' })
+  }
 })
+
 
 // 回傳所有運送方式（假資料庫）
 app.get('/shipping-options', (req, res) => {
@@ -231,17 +206,15 @@ app.get('/coupons', (req, res) => {
 
 
 // ✅ 自動合併相同 productId 的商品進購物車
-app.post('/cart', authenticateToken, async (req, res) => {
+app.post('/cart', authenticateFirebaseToken, async (req, res) => {
   const { products } = req.body;
 
   if (!products || !products.length) {
     return res.status(400).json({ message: 'Products required' });
   }
 
-  const user = await User.findById(req.user.id);
-  if (!user) {
-    return res.status(404).json({ message: 'User not found' });
-  }
+  const { uid, email } = req.user
+  const user = await findOrCreateUser(uid, email)
 
   for (const p of products) {
     const info = fakeProductDatabase[p.productId];
@@ -274,15 +247,15 @@ app.post('/cart', authenticateToken, async (req, res) => {
 
 
 // 商品從購物車刪除（可刪１～多個商品)
-app.delete('/cart', authenticateToken, async (req, res) => {
+app.delete('/cart', authenticateFirebaseToken, async (req, res) => {
   const { productIds } = req.body
 
   if (!Array.isArray(productIds) || productIds.length === 0) {
     return res.status(400).json({ message: 'productIds must be a non-empty array' })
   }
 
-  const user = await User.findById(req.user.id)
-  if (!user) return res.status(404).json({ message: 'User not found' })
+  const { uid, email } = req.user
+  const user = await findOrCreateUser(uid, email)
 
   const cart = user.cart
   const originalCount = cart.products.length
@@ -302,15 +275,15 @@ app.delete('/cart', authenticateToken, async (req, res) => {
 
 
 // 改某商品訂購數量
-app.put('/cart/:productId', authenticateToken, async (req, res) => {
+app.put('/cart/:productId', authenticateFirebaseToken, async (req, res) => {
   const { quantity } = req.body
 
   if (typeof quantity !== 'number' || quantity < 1) {
     return res.status(400).json({ message: 'Invalid quantity' })
   }
 
-  const user = await User.findById(req.user.id)
-  if (!user) return res.status(404).json({ message: 'User not found' })
+  const { uid, email } = req.user
+  const user = await findOrCreateUser(uid, email)
 
   // ✅ 防呆
   if (!user.cart) {
@@ -328,7 +301,7 @@ app.put('/cart/:productId', authenticateToken, async (req, res) => {
 
 
 // 建立訂單
-app.post('/order', authenticateToken, async (req, res) => {
+app.post('/order', authenticateFirebaseToken, async (req, res) => {
   const { products, couponId, shippingId } = req.body
 
   // 從假資料庫取得優惠與運送資訊
@@ -346,10 +319,8 @@ app.post('/order', authenticateToken, async (req, res) => {
     return res.status(400).json({ message: 'Products required' })
   }
 
-  const user = await User.findById(req.user.id)
-  if (!user) {
-    return res.status(404).json({ message: 'User not found' })
-  }
+  const { uid, email } = req.user
+  const user = await findOrCreateUser(uid, email)
 
   const fullProducts = []
   let totalAmount = 0
@@ -401,7 +372,7 @@ app.post('/order', authenticateToken, async (req, res) => {
 
 
 // 修改訂單
-app.put('/order/:orderId', authenticateToken, async (req, res) => {
+app.put('/order/:orderId', authenticateFirebaseToken, async (req, res) => {
   const { products, couponId, shippingId } = req.body
 
   // ✅ 從假資料庫查出運送與折扣資訊
@@ -416,8 +387,8 @@ app.put('/order/:orderId', authenticateToken, async (req, res) => {
   const shippingFee = shippingData.ShippingFee
 
   // ✅ 驗證使用者與訂單
-  const user = await User.findById(req.user.id)
-  if (!user) return res.status(404).json({ message: 'User not found' })
+  const { uid, email } = req.user
+  const user = await findOrCreateUser(uid, email)
 
   const order = user.orders.id(req.params.orderId)
   if (!order) return res.status(404).json({ message: 'Order not found' })
@@ -475,9 +446,9 @@ app.put('/order/:orderId', authenticateToken, async (req, res) => {
 
 
 // 刪除訂單
-app.delete('/order/:orderId', authenticateToken, async (req, res) => {
-  const user = await User.findById(req.user.id)
-  if (!user) return res.status(404).json({ message: 'User not found' })
+app.delete('/order/:orderId', authenticateFirebaseToken, async (req, res) => {
+  const { uid, email } = req.user
+  const user = await findOrCreateUser(uid, email)
   const lenBefore = user.orders.length
   user.orders = user.orders.filter(o => o._id.toString() !== req.params.orderId)
   if (user.orders.length === lenBefore) return res.status(404).json({ message: 'Order not found' })
@@ -487,7 +458,7 @@ app.delete('/order/:orderId', authenticateToken, async (req, res) => {
 
 
 // 新增評論（支援圖片上傳至 MongoDB）
-app.post('/order/:orderId/review', authenticateToken, upload.array('images', 5), async (req, res) => {
+app.post('/order/:orderId/review', authenticateFirebaseToken, upload.array('images', 5), async (req, res) => {
   try {
     const { comment, rating } = req.body
 
@@ -497,8 +468,8 @@ app.post('/order/:orderId/review', authenticateToken, upload.array('images', 5),
     }
 
     // 找使用者與訂單
-    const user = await User.findById(req.user.id)
-    if (!user) return res.status(404).json({ message: 'User not found' })
+    const { uid, email } = req.user
+    const user = await findOrCreateUser(uid, email)
 
     const order = user.orders.id(req.params.orderId)
     if (!order) return res.status(404).json({ message: 'Order not found' })
@@ -534,9 +505,9 @@ app.post('/order/:orderId/review', authenticateToken, upload.array('images', 5),
 
 
 // 刪除評論
-app.delete('/order/:orderId/review', authenticateToken, async (req, res) => {
-  const user = await User.findById(req.user.id)
-  if (!user) return res.status(404).json({ message: 'User not found' })
+app.delete('/order/:orderId/review', authenticateFirebaseToken, async (req, res) => {
+  const { uid, email } = req.user
+  const user = await findOrCreateUser(uid, email)
   const order = user.orders.id(req.params.orderId)
   if (!order || !order.review) return res.status(404).json({ message: 'Review not found' })
   order.review = undefined
@@ -545,9 +516,9 @@ app.delete('/order/:orderId/review', authenticateToken, async (req, res) => {
 })
 
 // 取得圖片串流
-app.get('/order/:orderId/review/image/:index', authenticateToken, async (req, res) => {
-  const user = await User.findById(req.user.id)
-  if (!user) return res.status(404).json({ message: 'User not found' })
+app.get('/order/:orderId/review/image/:index', authenticateFirebaseToken, async (req, res) => {
+  const { uid, email } = req.user
+  const user = await findOrCreateUser(uid, email)
   const order = user.orders.id(req.params.orderId)
   if (!order || !order.review) return res.status(404).json({ message: 'Review not found' })
   const image = order.review.imageFiles[req.params.index]
