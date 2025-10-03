@@ -17,7 +17,7 @@ app.use(cors())
 
 // ✅ 初始化 Firebase Admin
 admin.initializeApp({
-  credential: admin.credential.cert("/etc/secrets/service-account.json")
+  credential: admin.credential.cert("/etc/secrets/shopping-8f544-firebase-adminsdk-fbsvc-c1e9b1b9a8.json")
 });
 
 // ✅ Firebase 身份驗證 middleware
