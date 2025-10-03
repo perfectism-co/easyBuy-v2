@@ -516,17 +516,36 @@ app.delete('/order/:orderId/review', authenticateFirebaseToken, async (req, res)
 })
 
 // 取得圖片串流
-app.get('/order/:orderId/review/image/:index', authenticateFirebaseToken, async (req, res) => {
-  const { uid, email } = req.user
-  const user = await findOrCreateUser(uid, email)
-  const order = user.orders.id(req.params.orderId)
-  if (!order || !order.review) return res.status(404).json({ message: 'Review not found' })
-  const image = order.review.imageFiles[req.params.index]
-  if (!image) return res.status(404).json({ message: 'Image not found' })
+// app.get('/order/:orderId/review/image/:index', authenticateFirebaseToken, async (req, res) => {
+//   const { uid, email } = req.user
+//   const user = await findOrCreateUser(uid, email)
+//   const order = user.orders.id(req.params.orderId)
+//   if (!order || !order.review) return res.status(404).json({ message: 'Review not found' })
+//   const image = order.review.imageFiles[req.params.index]
+//   if (!image) return res.status(404).json({ message: 'Image not found' })
 
-  res.set('Content-Type', 'image/jpeg')
-  res.send(image)
+//   res.set('Content-Type', 'image/jpeg')
+//   res.send(image)
+// })
+// 完全公開圖片
+app.get('/order/:orderId/review/image/:index', async (req, res) => {
+  try {
+    const user = await User.findOne({ "orders._id": req.params.orderId })
+    if (!user) return res.status(404).json({ message: 'User not found' })
+
+    const order = user.orders.id(req.params.orderId)
+    if (!order || !order.review) return res.status(404).json({ message: 'Review not found' })
+
+    const image = order.review.imageFiles[req.params.index]
+    if (!image) return res.status(404).json({ message: 'Image not found' })
+
+    res.set('Content-Type', 'image/jpeg')
+    res.send(image)
+  } catch (err) {
+    res.status(500).json({ message: 'Server error', error: err.message })
+  }
 })
+
 
 
 // 🧠 MongoDB 連線成功後才啟動伺服器
